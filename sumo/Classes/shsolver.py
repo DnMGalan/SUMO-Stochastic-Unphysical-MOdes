@@ -1,18 +1,21 @@
 import numpy as np
-from qutip import QobjEvo, mesolve
+from qutip import Qobj, QobjEvo, mesolve
 from qutip.solver.parallel import parallel_map
 
 
 class SHSolver:
+    """Solver for stochastic pseudomode models.
+
+    Implements the stochastic unravelling of the classical bath
+    correlation function described in PRX Quantum 4, 030316 (2023).
     """
-    Constructs a stochastic version of the pseudomode-model"""
 
     def __init__(self):
         # TODO: Define class inputs and initialization logic
         pass
 
-    def compute_coefficients_basis(self, t_corr_list: np.array,
-                                     C_list: np.array, n_cut: int) -> np.array:
+    def compute_coefficients_basis(self, t_corr_list: np.ndarray,
+                                   C_list: np.ndarray, n_cut: int) -> np.ndarray:
         """
         Compute the Fourier cosine coefficients of the
         classical bath correlation function. Implements
@@ -46,8 +49,8 @@ class SHSolver:
         coeffs = dt * np.sum(product[:, :-1], axis=1) / (2 * T)
         return coeffs
 
-    def generate_A(self, t_corr_list: np.array, coeff_list: np.array,
-                   n_cut: int) -> np.array:
+    def generate_A(self, t_corr_list: np.ndarray, coeff_list: np.ndarray,
+                   n_cut: int) -> np.ndarray:
         """
         Builds the matrix `A` used to generate the stochastic field ξ(t)
         following Eq. (14) of PRX Quantum 4, 030316 (2023):
@@ -57,7 +60,7 @@ class SHSolver:
         t_corr_list : np.ndarray
             Time grid defining the time domain of ξ(t).
         coeff_list : np.ndarray
-            Coefficients c_n obtained from `compute_coefficients_basis_2`.
+            Coefficients c_n obtained from `compute_coefficients_basis`.
         n_cut : int
 
         Returns
@@ -69,21 +72,21 @@ class SHSolver:
 
         T = t_corr_list[-1]
         n_vec = np.arange(1, n_cut + 1)
-        first_col = np.sqrt(coeff_list[0]) * np.ones((len(t_corr_list), 1))
+        first_col = np.sqrt(coeff_list[0]).astype(complex) * np.ones((len(t_corr_list), 1))
         theta = np.outer(t_corr_list, n_vec) * np.pi / T
         sqrt2 = np.sqrt(2)
-        sqrt_coeffs = np.sqrt(coeff_list[1:n_cut + 1])
+        sqrt_coeffs = np.sqrt(coeff_list[1:n_cut + 1].astype(complex))
         cos_terms = sqrt2 * sqrt_coeffs * np.cos(theta)
         sin_terms = sqrt2 * sqrt_coeffs * np.sin(theta)
-        interleaved = np.empty((len(t_corr_list), 2 * n_cut))
+        interleaved = np.empty((len(t_corr_list), 2 * n_cut), dtype=complex)
         interleaved[:, 0::2] = cos_terms
         interleaved[:, 1::2] = sin_terms
         A = np.concatenate([first_col, interleaved], axis=1)
-
+        
         return A
 
     def generate_xi_list(self, A: np.ndarray, n_cut: int, n_noise: int,
-                         mu: float = 0, sigma: float = 1) -> np.array:
+                         mu: float = 0, sigma: float = 1) -> np.ndarray:
         """
         Generate stochastic realizations of the classical field ξ(t).
 
@@ -91,6 +94,8 @@ class SHSolver:
         independent Gaussian random variables ξ_n with mean `mu` and
         variance `sigma`, then combining them with the deterministic
         basis matrix `A` to form stochastic time-dependent fields ξ(t).
+
+        TODO: Add a seed parameter for reproducibility.
 
         Parameters
         ----------
@@ -143,8 +148,8 @@ class SHSolver:
         xi_list = self.generate_xi_list(A, n_cut, n_noise)
         return xi_list
 
-    def one_run(self, k, L, H_xi, xi_list, c_list, t_list, psi0, obs_list,
-                args, options):
+    def one_run(self, k, L, H_xi, xi_list, c_list, t_list, t_corr_list,
+                psi0, obs_list, args, options):
 
         """
         Solves the stochastic Lindblad equation Eq. (16) in PRX Quantum 4,
@@ -179,18 +184,22 @@ class SHSolver:
         result : np.ndarray
             TODO: add better description
         """
-
         L_m = QobjEvo(
             [L, [H_xi, xi_list[k]]],
-            tlist=np.linspace(t_list[0], t_list[-1], len(xi_list[k])),
+            tlist=t_corr_list,
         )
+
         result = mesolve(
             L_m, psi0, t_list, c_list, obs_list, args=args, options=options
-        ).expect[0]
-        return result
+        )
 
-    def average_dynamics_parallel(self, L, H_xi, xi_list, c_list, t_list, psi0,
-                                  n_noise, obs_list, args, options):
+        if options["store_states"]:
+            return result.expect, result.states
+        else:
+            return result.expect
+
+    def average_dynamics_parallel(self, *, L, H_xi, xi_list, c_list, t_list, t_corr_list,
+                                  psi0, n_noise, obs_list, args, options=None):
         """
         Runs multiple realizations of the stochastic master equation (Eq. 16)
         in parallel using QuTiP’s `parallel_map`.
@@ -220,23 +229,37 @@ class SHSolver:
 
         Returns
         -------
-        dynamics_average : float
-            Mean value of the results.
-        sigma : float
-            Standard deviation of the results.
-        dynamics_list : np.ndarray
-            Individual trajectory results.
+        dynamics_average : np.ndarray
+            Mean expectation value across realizations at each time point.
+        SME : np.ndarray
+            Standard error of the mean.
+        expect_list : list of np.ndarray
+            Individual expectation-value trajectories for each realization.
+        states_list : list of list of Qobj  (only if ``store_states=True``)
+            Full per-realization density-matrix trajectories,
+            ``states_list[k][t]`` gives ρ_k(t).
         """
+
+        if options is None:
+            options = {"store_states": False}
+
+        store_states = options.get("store_states", False)
 
         dynamics_list = parallel_map(
             self.one_run,
             range(n_noise),
-            task_args=(L, H_xi, xi_list, c_list, t_list, psi0,
-                       obs_list, args, options),
+            task_args=(L, H_xi, xi_list, c_list, t_list, t_corr_list,
+                       psi0, obs_list, args, options),
             progress_bar=True)
 
-        dynamics_arr = np.array(dynamics_list)
-        dynamics_average = np.mean(dynamics_arr)
-        sigma = np.std(dynamics_arr)
+        if store_states:
+            expect_list, states_list = zip(*dynamics_list)
+        else:
+            expect_list = dynamics_list
+            states_list = None
 
-        return dynamics_average, sigma, dynamics_list
+        dynamics_arr = np.asarray(expect_list)
+        dynamics_average = np.mean(dynamics_arr, axis=0)
+        SME = np.std(dynamics_arr, axis=0) / np.sqrt(n_noise)
+
+        return dynamics_average, SME, expect_list, states_list
